@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# External FCC-ee lattice-model checkout
+acc-models-fcc-ee/
+
+# Generated artefacts
+FCC_Magnet_Report_*.xlsx
+catalogues/
+plots/
