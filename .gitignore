@@ -8,4 +8,4 @@ acc-models-fcc-ee/
 # Generated artefacts
 #FCC_Magnet_Report_*.xlsx
 catalogues/
-plots/
+#plots/
