@@ -8,6 +8,10 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
+from scipy.interpolate import interp1d
+from scipy.spatial import cKDTree
+
+#%%
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -22,6 +26,9 @@ available_energies = sorted(
     if p.is_dir() and (p / f'fccee_{p.name}.json').exists()
 )
 
+
+#%%
+
 parser = argparse.ArgumentParser(
     description='Create FCC-ee magnet and circuit catalogues.'
 )
@@ -30,7 +37,9 @@ parser.add_argument(
     choices=available_energies,
     help='Generate one energy only. Without this option all energies are generated.',
 )
-args = parser.parse_args()
+#args = parser.parse_args()
+args, unknown = parser.parse_known_args()
+
 
 if args.energy is None:
     print(f'Generating all available energies: {", ".join(e.upper() for e in available_energies)}')
@@ -49,6 +58,8 @@ reference_radius = 0.035
 lattice_version  = VERSION_FILE.read_text().strip()
 lattice_model    = lattice_version.rsplit('.', 2)[0]
 
+
+
 text_output_dir = PROJECT_DIR / 'catalogues' / mode / lattice_version
 text_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -62,12 +73,23 @@ rename_file         = text_output_dir / f'FCC_arc_rename_catalogue_{mode}.txt'
 # LOAD LATTICE
 # ══════════════════════════════════════════════════════════════════════════════
 
-line   = xt.load(str(LATTICE_ROOT / mode / f'fccee_{mode}.json')).fccee_p_ring
+beam1_lattice_file = (
+    LATTICE_ROOT / mode / f'fccee_{mode}_beam_1_positrons.json'
+)
+if beam1_lattice_file.exists():
+    line = xt.load(str(beam1_lattice_file)).fccee_p_ring
+    lattice_source_file = beam1_lattice_file
+else:
+    lattice_source_file = LATTICE_ROOT / mode / f'fccee_{mode}.json'
+    line = xt.load(str(lattice_source_file)).fccee_p_ring
 tab    = line.get_table()
 twissz = line.twiss4d()
 brho   = line.particle_ref.p0c[0] / line.particle_ref.q0 / 299792458
 circumference = float(tab.s[-1])
-print(f'Loaded lattice: {lattice_model}, circumference = {circumference:.3f} m, brho = {brho:.3f} Tm')
+print(
+    f'Loaded lattice: {lattice_model}, source = {lattice_source_file.name}, '
+    f'circumference = {circumference:.3f} m, brho = {brho:.3f} Tm'
+)
 
 #%%
 
@@ -104,6 +126,13 @@ ip_sector = {'ipa': 1, 'ipb': 2, 'ipd': 3, 'ipf': 4,
 S3_DS_OFFSET  = 100
 S3_ARC_OFFSET = 200
 S3_SAME_GIRDER_MAX_DIST = 3.0  # [m], nearby devices inherit nearest quad cell
+
+# A proposed beam-2 element is accepted only when its longitudinal position is
+# close to the nearest point on the interpolated beam-2 reference trajectory.
+# This is deliberately different from the physical inter-beam distance, which
+# can legitimately be several metres in an insertion.
+B2_ELEMENT_MATCH_MAX_DS = 0.25  # [m], tolerance outside the B2 magnet span
+B2_SURVEY_INTERPOLATION_POINTS = 360_000
 
 KEEP_TYPES    = {'Quadrupole', 'RBend', 'Sextupole', 'Multipole', 'Marker'}
 SKIP_PREFIXES = ('hcor_', 'vcor_', 'bpm_')
@@ -508,6 +537,222 @@ for name, s in zip(tab.name[magnet_mask], tab.s[magnet_mask]):
 
 df_raw = pd.DataFrame(records)
 df_raw['family'] = df_raw['name'].str.replace(r'[_\.]?\d+$', '', regex=True).str.upper()
+
+# ═════════════════════════════════════════════════════════════════════════
+# BEAM-2 GEOMETRY MATCH FOR THE FLAT MAGNET LIST
+# ═══════════════════════════════════════════════════════════════════════
+
+B2_MATCH_COLUMNS = [
+    'closest_b2_element',
+    'b2_match_status',
+    'b2_element_s',
+    'b2_matched_s',
+    'b2_longitudinal_offset',
+    'b2_longitudinal_displacement',
+    'interbeam_horizontal',
+    'interbeam_vertical',
+    'interbeam_3d',
+    'distance_to_b2_trajectory',
+]
+
+
+def add_beam2_geometry_matches(df, beam1, beam2):
+    """Match each beam-1 magnet to a nearby same-type beam-2 magnet.
+
+    The dense interpolation is used only to locate the closest station on the
+    beam-2 trajectory.  The reported element name and inter-beam distances are
+    calculated from an actual beam-2 magnet survey point.  The longitudinal
+    offset and status reveal cases where no beam-2 magnet is present nearby.
+    """
+    theta_init = 15e-3
+    sv1 = beam1.survey(theta0=theta_init)
+    sv2 = beam2.survey(theta0=np.pi - theta_init)
+
+    s2 = np.asarray(sv2['s'], dtype=float)
+    s1 = np.asarray(sv1['s'], dtype=float)
+    xyz1_survey = np.column_stack([
+        np.asarray(sv1['X'], dtype=float),
+        np.asarray(sv1['Y'], dtype=float),
+        np.asarray(sv1['Z'], dtype=float),
+    ])
+    xyz2 = np.column_stack([
+        np.asarray(sv2['X'], dtype=float),
+        np.asarray(sv2['Y'], dtype=float),
+        np.asarray(sv2['Z'], dtype=float),
+    ])
+
+    # interp1d requires unique, increasing longitudinal coordinates.
+    unique_s1, unique_idx1 = np.unique(s1, return_index=True)
+    xyz1_unique = xyz1_survey[unique_idx1]
+    unique_s2, unique_idx = np.unique(s2, return_index=True)
+    xyz2_unique = xyz2[unique_idx]
+    s2_dense = np.linspace(
+        unique_s2[0], unique_s2[-1], B2_SURVEY_INTERPOLATION_POINTS
+    )
+    xyz2_dense = np.column_stack([
+        interp1d(unique_s2, xyz2_unique[:, axis], kind='linear')(s2_dense)
+        for axis in range(3)
+    ])
+    trajectory_tree = cKDTree(xyz2_dense)
+
+    sv1_index = {str(name): i for i, name in enumerate(sv1['name'])}
+    sv2_index = {str(name): i for i, name in enumerate(sv2['name'])}
+
+    tab2 = beam2.get_table()
+    candidates_by_type = {}
+    for name, s, element_type in zip(tab2.name, tab2.s, tab2.element_type):
+        if element_type not in magnet_types or str(name) not in sv2_index:
+            continue
+        candidates_by_type.setdefault(str(element_type), []).append({
+            'name': str(name),
+            's': float(s),
+            'length': float(getattr(beam2[str(name)], 'length', 0.0) or 0.0),
+        })
+
+    result = {column: [] for column in B2_MATCH_COLUMNS}
+    circumference_b2 = float(unique_s2[-1])
+    used_b2_elements = set()
+
+    for _, magnet in df.iterrows():
+        name1 = str(magnet['name'])
+        element_type = str(magnet['element_type'])
+        idx1 = sv1_index.get(name1)
+
+        if idx1 is None:
+            result['closest_b2_element'].append('')
+            result['b2_match_status'].append('B1 SURVEY POINT NOT FOUND')
+            for column in B2_MATCH_COLUMNS[2:]:
+                result[column].append(np.nan)
+            continue
+
+        b1_centre_s = (
+            float(magnet['s']) + 0.5 * float(magnet['length'])
+        ) % float(unique_s1[-1])
+        xyz1 = np.array([
+            np.interp(b1_centre_s, unique_s1, xyz1_unique[:, axis])
+            for axis in range(3)
+        ])
+
+        distance_curve, dense_idx = trajectory_tree.query(xyz1)
+        closest_s2 = float(s2_dense[dense_idx])
+
+        candidates = candidates_by_type.get(element_type, [])
+        if not candidates:
+            result['closest_b2_element'].append('')
+            result['b2_match_status'].append('NO B2 MAGNET OF SAME TYPE')
+            result['b2_element_s'].append(np.nan)
+            result['b2_matched_s'].append(np.nan)
+            result['b2_longitudinal_offset'].append(np.nan)
+            result['b2_longitudinal_displacement'].append(np.nan)
+            result['interbeam_horizontal'].append(np.nan)
+            result['interbeam_vertical'].append(np.nan)
+            result['interbeam_3d'].append(np.nan)
+            result['distance_to_b2_trajectory'].append(float(distance_curve))
+            continue
+
+        def distance_to_magnet_span(candidate):
+            """Circular distance from closest_s2 to [start, start + length]."""
+            best_offset = np.inf
+            best_s = candidate['s']
+            best_displacement = np.nan
+            for shift in (-circumference_b2, 0.0, circumference_b2):
+                start = candidate['s'] + shift
+                end = start + candidate['length']
+                matched_s = min(max(closest_s2, start), end)
+                displacement = closest_s2 - matched_s
+                offset = abs(displacement)
+                if offset < best_offset:
+                    best_offset = offset
+                    best_s = matched_s % circumference_b2
+                    best_displacement = displacement
+            return float(best_offset), float(best_s), float(best_displacement)
+
+        candidate_matches = [
+            (candidate, *distance_to_magnet_span(candidate))
+            for candidate in candidates
+        ]
+        # Enforce one-to-one correspondence. Without this, two neighbouring B1
+        # magnets can select the same B2 magnet when their closest trajectory
+        # stations fall inside the same long magnet span.
+        candidate_matches.sort(key=lambda item: item[1])
+        unused_matches = [
+            item for item in candidate_matches
+            if item[0]['name'] not in used_b2_elements
+        ]
+
+        if unused_matches:
+            match, match_offset, matched_s2, match_displacement = unused_matches[0]
+        else:
+            match, match_offset, matched_s2, match_displacement = candidate_matches[0]
+
+        if match_offset > B2_ELEMENT_MATCH_MAX_DS:
+            result['closest_b2_element'].append('')
+            result['b2_match_status'].append(
+                f'NO B2 MATCH WITHIN {B2_ELEMENT_MATCH_MAX_DS:g} m'
+            )
+            result['b2_element_s'].append(match['s'])
+            result['b2_matched_s'].append(matched_s2)
+            result['b2_longitudinal_offset'].append(match_offset)
+            result['b2_longitudinal_displacement'].append(match_displacement)
+            result['interbeam_horizontal'].append(np.nan)
+            result['interbeam_vertical'].append(np.nan)
+            result['interbeam_3d'].append(np.nan)
+            result['distance_to_b2_trajectory'].append(float(distance_curve))
+            continue
+
+        # After identifying the corresponding B2 magnet, compare the centres
+        # of the two magnets. Matching still uses the complete B2 magnet span.
+        b2_centre_s = (
+            match['s'] + 0.5 * match['length']
+        ) % circumference_b2
+        xyz2_match = np.array([
+            np.interp(b2_centre_s, unique_s2, xyz2_unique[:, axis])
+            for axis in range(3)
+        ])
+        delta = xyz2_match - xyz1
+
+        result['closest_b2_element'].append(match['name'])
+        result['b2_match_status'].append('OK')
+        used_b2_elements.add(match['name'])
+        result['b2_element_s'].append(match['s'])
+        result['b2_matched_s'].append(matched_s2)
+        result['b2_longitudinal_offset'].append(match_offset)
+        result['b2_longitudinal_displacement'].append(match_displacement)
+        result['interbeam_horizontal'].append(float(np.hypot(delta[0], delta[2])))
+        result['interbeam_vertical'].append(float(abs(delta[1])))
+        result['interbeam_3d'].append(float(np.linalg.norm(delta)))
+        result['distance_to_b2_trajectory'].append(float(distance_curve))
+
+    for column in B2_MATCH_COLUMNS:
+        df[column] = result[column]
+
+
+beam1_geometry_file = LATTICE_ROOT / mode / f'fccee_{mode}_beam_1_positrons.json'
+beam2_geometry_file = LATTICE_ROOT / mode / f'fccee_{mode}_beam_2_electrons.json'
+
+if beam1_geometry_file.exists() and beam2_geometry_file.exists():
+    print('Matching beam-1 magnets to the interpolated beam-2 survey...')
+    line_b1_geometry = line
+    line_b2_geometry = xt.load(str(beam2_geometry_file)).fccee_e_ring
+    add_beam2_geometry_matches(df_raw, line_b1_geometry, line_b2_geometry)
+    print(df_raw['b2_match_status'].value_counts(dropna=False).to_string())
+
+    accepted_b2 = df_raw.loc[
+        df_raw['b2_match_status'].eq('OK'), 'closest_b2_element'
+    ]
+    duplicated_b2 = accepted_b2[accepted_b2.duplicated(keep=False)]
+    if not duplicated_b2.empty:
+        duplicate_names = sorted(duplicated_b2.unique())
+        raise RuntimeError(
+            'Duplicate accepted B2 assignments found; workbook not written: '
+            + ', '.join(duplicate_names[:20])
+        )
+else:
+    print(f'Beam-2 geometry files are not available for energy {mode.upper()}.')
+    for column in B2_MATCH_COLUMNS:
+        df_raw[column] = np.nan
+    df_raw['closest_b2_element'] = ''
+    df_raw['b2_match_status'] = 'B2 LATTICE NOT AVAILABLE'
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COMMENT FUNCTION  (unchanged from script 2)
@@ -1628,7 +1873,7 @@ FLAT_HDRS = {
     'region':       'Region',
     'circuit':      'Circuit',
     'element_type': 'Type',
-    's [m]':        's\n[m]',
+    's [m]':        'B1 s\n[m]',
     'length [m]':   'Length\n[m]',
     'bfield [T]':   'B-field\n[T]',
     'k1 [1/m2]':    'k1\n[1/m²]',
@@ -1640,10 +1885,14 @@ FLAT_HDRS = {
     'betx [m]':     'βx\n[m]',
     'bety [m]':     'βy\n[m]',
     'comment':      'Comment',
+    'closest_b2_element':   'B2 element\nname',
+    'interbeam_horizontal': 'Centre horizontal\nseparation [m]',
+    'interbeam_vertical':   'Centre vertical\nseparation [m]',
 }
 NC7 = len(FLAT_HDRS)
 FMT7 = {6:FMT_F2, 7:FMT_F3, 8:FMT_F3, 9:FMT_F6, 10:FMT_F3, 11:FMT_F4,
-        12:FMT_F6, 13:FMT_F3, 14:FMT_F4, 15:FMT_F2, 16:FMT_F2}
+        12:FMT_F6, 13:FMT_F3, 14:FMT_F4, 15:FMT_F2, 16:FMT_F2,
+        19:FMT_F3, 20:FMT_F3}
 title_row(ws7, 1, NC7, 'FCC-ee — All Magnets Element-by-Element (with Circuits)')
 write_hdr(ws7, 2, FLAT_HDRS)
 row = 3; prev_reg = None
@@ -1664,10 +1913,14 @@ for _, r_data in df_raw.sort_values('s').iterrows():
         r_data.get('k2',      np.nan), r_data.get('sgrad',  np.nan),
         r_data.get('sfield',  np.nan), r_data.get('betx',   np.nan),
         r_data.get('bety',    np.nan), r_data.get('comment',''),
+        r_data.get('closest_b2_element', ''),
+        r_data.get('interbeam_horizontal', np.nan),
+        r_data.get('interbeam_vertical', np.nan),
     ]
     write_row(ws7, row, vals, rf=rf, fmts=FMT7); row += 1
 set_w(ws7, {'A':22,'B':22,'C':9,'D':30,'E':12,'F':9,'G':8,'H':8,'I':9,
-            'J':9,'K':9,'L':9,'M':9,'N':9,'O':8,'P':8,'Q':35})
+            'J':9,'K':9,'L':9,'M':9,'N':9,'O':8,'P':8,'Q':35,
+            'R':24,'S':18,'T':18})
 freeze_filter(ws7, 'A3', f'A2:{get_column_letter(NC7)}2')
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2139,4 +2392,15 @@ ws13.auto_filter.ref = (
 wb.save(excel_file)
 print(f'\nExcel report saved to {excel_file}')
 print(f'  Sheets: {[s.title for s in wb.worksheets]}')
+sys.exit(0)  # Do not execute the exploratory survey cells appended below.
+# %%
+
+
+
+
+
+#%%
+
+
+
 # %%
