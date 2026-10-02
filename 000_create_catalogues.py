@@ -539,6 +539,27 @@ df_raw = pd.DataFrame(records)
 df_raw['family'] = df_raw['name'].str.replace(r'[_\.]?\d+$', '', regex=True).str.upper()
 
 # ═════════════════════════════════════════════════════════════════════════
+# BEAM-1 SURVEY FOR THE FLAT MAGNET LIST
+# ═════════════════════════════════════════════════════════════════════════
+
+B1_SURVEY_THETA0 = 15e-3  # [rad], same initial angle as the optics survey plots
+B1_SURVEY_ORIGIN = 'ipa'  # survey is shifted so that this marker sits at (0, 0, 0)
+
+def add_beam1_survey(df, beam1):
+    """Add the B1 survey (entry of each magnet) with IPA as the origin."""
+    sv = beam1.survey(theta0=B1_SURVEY_THETA0)
+    sv_index = {str(n): i for i, n in enumerate(sv['name'])}
+    origin = sv_index[B1_SURVEY_ORIGIN]
+    for axis in ('X', 'Y', 'Z'):
+        coord = np.asarray(sv[axis], dtype=float)
+        coord = coord - coord[origin]
+        df[f'b1_survey_{axis}'] = [
+            coord[sv_index[n]] if n in sv_index else np.nan for n in df['name']
+        ]
+
+add_beam1_survey(df_raw, line)
+
+# ═════════════════════════════════════════════════════════════════════════
 # BEAM-2 GEOMETRY MATCH FOR THE FLAT MAGNET LIST
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1888,11 +1909,14 @@ FLAT_HDRS = {
     'closest_b2_element':   'B2 element\nname',
     'interbeam_horizontal': 'Centre horizontal\nseparation [m]',
     'interbeam_vertical':   'Centre vertical\nseparation [m]',
+    'b1_survey_X':          'B1 survey X\n[m]',
+    'b1_survey_Y':          'B1 survey Y\n[m]',
+    'b1_survey_Z':          'B1 survey Z\n[m]',
 }
 NC7 = len(FLAT_HDRS)
 FMT7 = {6:FMT_F2, 7:FMT_F3, 8:FMT_F3, 9:FMT_F6, 10:FMT_F3, 11:FMT_F4,
         12:FMT_F6, 13:FMT_F3, 14:FMT_F4, 15:FMT_F2, 16:FMT_F2,
-        19:FMT_F3, 20:FMT_F3}
+        19:FMT_F3, 20:FMT_F3, 21:FMT_F3, 22:FMT_F3, 23:FMT_F3}
 title_row(ws7, 1, NC7, 'FCC-ee — All Magnets Element-by-Element (with Circuits)')
 write_hdr(ws7, 2, FLAT_HDRS)
 row = 3; prev_reg = None
@@ -1916,11 +1940,14 @@ for _, r_data in df_raw.sort_values('s').iterrows():
         r_data.get('closest_b2_element', ''),
         r_data.get('interbeam_horizontal', np.nan),
         r_data.get('interbeam_vertical', np.nan),
+        r_data.get('b1_survey_X', np.nan),
+        r_data.get('b1_survey_Y', np.nan),
+        r_data.get('b1_survey_Z', np.nan),
     ]
     write_row(ws7, row, vals, rf=rf, fmts=FMT7); row += 1
 set_w(ws7, {'A':22,'B':22,'C':9,'D':30,'E':12,'F':9,'G':8,'H':8,'I':9,
             'J':9,'K':9,'L':9,'M':9,'N':9,'O':8,'P':8,'Q':35,
-            'R':24,'S':18,'T':18})
+            'R':24,'S':18,'T':18,'U':14,'V':14,'W':14})
 freeze_filter(ws7, 'A3', f'A2:{get_column_letter(NC7)}2')
 
 # ══════════════════════════════════════════════════════════════════════════════
